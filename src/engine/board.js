@@ -391,27 +391,59 @@ function pickRandom(list, rng = Math.random) {
 }
 
 /**
- * Rendszer altal valasztott elsodleges pozicio, az ellenfel elozo lepese
- * koruli teruletbol (spec: "az ellenfel elozo lepese koruli teruleten").
- * Ha nincs meg elozo lepes (elso kor), vagy a koruli teruleten nincs szabad
- * mezo, a teljes ervenyes-elsodleges listabol valaszt.
+ * A `center` korul a legszukebb (Chebyshev-tavolsag szerinti) "gyuru" osszes
+ * MEG URES mezoje - r=0-tol kezdve kifele "spiralozva" novekvo sugarral,
+ * amig talal legalabb egyet. Ez adja a rendszer/idokorlat-automata lepesenek
+ * ERTELMES (nem vaktaban valasztott) celpontjait: mindig a lehetu
+ * legszorosabban `center`-hez, csak akkor tavolodva tole, ha ott mar
+ * betelt minden hely.
+ * 2026-08-31 (felhasznaloi visszajelzes alapjan, elso elesben tesztelt online
+ * partibol): a korabbi valtozat egy FIX (radius=4) negyzeten belul valasztott
+ * TELJESEN veletlenszeruen - ez tavolabbi, "vaktaban" lerakott jeleket adott
+ * (pl. az ellenfel elozo lepese mellett kozvetlenul ures mezo volt, a rendszer
+ * megis 3-4 mezovel arrebb lepett). Az uj valtozat mindig a lehetu
+ * legkozelebbi ures mezot valasztja (tobb egyenlo-tavolsagu jelolt eseten
+ * veletlenszeruen kozuluk), ami sokkal inkabb "ertelmes szomszedos lepesnek"
+ * hat, nem vak talalomra valasztottnak.
+ */
+function nearestEmptyCellsAround(state, center) {
+  const { size, board } = state;
+  for (let r = 0; r <= size; r++) {
+    const ring = [];
+    for (let dr = -r; dr <= r; dr++) {
+      for (let dc = -r; dc <= r; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== r) continue; // csak a gyuru pereme, ne a mar vizsgalt belseje
+        const row = center.row + dr;
+        const col = center.col + dc;
+        if (!inBounds(size, row, col)) continue;
+        if (board[row][col].state !== 'empty') continue;
+        ring.push({ row, col });
+      }
+    }
+    if (ring.length > 0) return ring;
+  }
+  return [];
+}
+
+/**
+ * Rendszer altal valasztott elsodleges pozicio: az ellenfel elozo lepesehez
+ * (vagy - ha meg nincs elozo lepes - a tabla kozeppontjahoz) legkozelebbi ures
+ * mezok kozul valaszt (lasd nearestEmptyCellsAround fenti magyarazata). A
+ * `radius` parameter a korabbi, fix-sugaru valasztas maradvanya - mar nem
+ * hasznalt, csak visszafele kompatibilitasbol maradt meg a fuggveny
+ * alairasaban (hivo kod tovabbra is athatja, hatastalanul).
  */
 function autoPlacePrimary(state, rng = Math.random, radius = 4) {
   const validPrimary = getValidPrimary(state);
   if (validPrimary.length === 0) return null;
 
   const lastOpponentMove = [...state.history].reverse().find((h) => h.player !== state.currentPlayer);
-  let candidates = validPrimary;
+  const center = lastOpponentMove
+    ? lastOpponentMove.primary
+    : { row: Math.floor(state.size / 2), col: Math.floor(state.size / 2) };
 
-  if (lastOpponentMove) {
-    const center = lastOpponentMove.primary;
-    const nearby = validPrimary.filter(
-      (p) => Math.abs(p.row - center.row) <= radius && Math.abs(p.col - center.col) <= radius
-    );
-    if (nearby.length > 0) candidates = nearby;
-  }
-
-  return pickRandom(candidates, rng);
+  const nearest = nearestEmptyCellsAround(state, center);
+  return pickRandom(nearest.length > 0 ? nearest : validPrimary, rng);
 }
 
 function autoPlaceSecondary(state, rng = Math.random) {
