@@ -19,6 +19,7 @@ function createServer({
   port = 4000,
   corsOrigin = '*',
   turnSeconds,
+  aiMoveDelayMs,
   tlsKeyPath,
   tlsCertPath,
   pingInterval,
@@ -44,7 +45,10 @@ function createServer({
     ...(pingTimeout ? { pingTimeout } : {}),
   });
 
-  const rooms = new RoomManager(io, turnSeconds ? { turnSeconds } : {});
+  const rooms = new RoomManager(io, {
+    ...(turnSeconds !== undefined ? { turnSeconds } : {}),
+    ...(aiMoveDelayMs !== undefined ? { aiMoveDelayMs } : {}),
+  });
 
   io.on('connection', (socket) => {
     socket.on('queue:join', ({ displayName } = {}) => {
@@ -115,6 +119,17 @@ function createServer({
         const result = rooms.applyMove(room, playerNumber, action, payload);
         if (!result.ok) {
           socket.emit('move:rejected', { error: result.error });
+          return;
+        }
+        // Az elsodleges lepes lerakasat ES annak visszavonasat SZANDEKOSAN
+        // csak magának a lepo felnek kuldjuk el, nem az egesz szobanak: az
+        // ellenfel csak akkor ertesuljon barmirol, ha a teljes lepespar
+        // (elsodleges+masodlagos) mar lezarult. Igy az ellenfel sem egy meg
+        // "fuggoben levo" elsodleges jelet, sem egy esetleges visszavonast nem
+        // lat elore - csak a kesz lepespart, egyszerre. (Felhasznaloi
+        // visszajelzes alapjan, elso elesben tesztelt online partibol.)
+        if (action === 'primary' || action === 'retract') {
+          socket.emit('state:update', { state: room.state, cause: action, result });
           return;
         }
         io.to(room.roomId).emit('state:update', { state: room.state, cause: action, result });
