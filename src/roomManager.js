@@ -190,10 +190,21 @@ class RoomManager {
       // Sikeres lepes utan a lepo jatekos kihagyott-kor-szamlaloja nullazodik
       // (o eppen most lepett, tehat nem hagyott ki semmit).
       if (room.players[playerNumber]) room.players[playerNumber].missedTurns = 0;
-      if (state.status === 'playing') {
-        // Barmilyen sikeres, jatekost valto lepes utan az ido ujraindul a
-        // kovetkezo korre (a switchPlayer/surrender mar beallitotta a
-        // megfelelo allapotot).
+      // FONTOS (2026-08-31, felhasznaloi visszajelzes alapjan): az ora
+      // ujrainditasa (es az esetleges lancolt AI-lepes ellenorzese) KIZAROLAG
+      // akkor tortenhet, ha a kor TENYLEGESEN atvaltott a masik jatekosra -
+      // ez csakis a lepespart LEZARO 'secondary' akcio utan all fenn (az
+      // engine ilyenkor mar meghivta a switchPlayer-t). Egy onmagaban levo
+      // 'primary' lepes (meg csak a fele lepespar!) vagy annak visszavonasa
+      // ('retract') NEM jelent korvaltast - a jatekos meg mindig ugyanabban
+      // a korben van. Korabban ITT FELTETEL NELKUL futott le az ora-ujrainditas
+      // minden sikeres akcio utan, ami azt a (nem szandekolt) hibat okozta,
+      // hogy mar a puszta elsodleges lepes lerakasa is visszaallitotta az
+      // orat a teljes koridore - a jatekos igy a masodlagos lepesre effektive
+      // duplajat idot kapott. A retractPrimary() az engine-ben kifejezetten
+      // szandekosan NEM allitja vissza az orat ("ne lehessen idot lopni") -
+      // ezt a szandekot itt korabban felulirtuk.
+      if (state.status === 'playing' && action === 'secondary') {
         this._resetTurnTimer(room);
         // Ha az uj soron levo jatekost mar korabban atvette a gep, azonnal
         // (nem varva az orara) lepjen. Ezt kovetkezo tick-re (setImmediate)
@@ -202,7 +213,7 @@ class RoomManager {
         // sorrendje a vezetekene a valos tortenessel egyezik.
         setImmediate(() => this._maybeAutoPlayAiTurns(room));
       }
-      // Ha a lepes veget vetett a meccsnek, a match:end kikuldeset (mint
+      // Ha a lepes veget vetette a meccsnek, a match:end kikuldeset (mint
       // eddig is) a hivo (server.js) vegzi a visszaadott result/room.state
       // alapjan - itt nem duplikaljuk.
     }
@@ -405,7 +416,21 @@ class RoomManager {
     }
   }
 
-  /** Meccs veget kozponti helyen kezeli: broadcast, idozito leallitasa, tokenek torlese. */
+  /**
+   * Meccs veget kozponti helyen kezeli: broadcast, idozito leallitasa, ES
+   * TELJES takaritas (sessionToken-ek, socketToRoom-terkep, maga a szoba is
+   * torlodik a `rooms` terkepbol). 2026-08-31 (felhasznaloi visszajelzes
+   * alapjan, "mi tortenik, ha mindket jatekost kidobja a rendszer" kerdesre
+   * vizsgalodva): korabban ez a fuggveny CSAK a sessionToken-eket torolte -
+   * a szoba maga es a socketToRoom-bejegyzesek soha, EGYETLEN veget ert
+   * meccsnel sem torlodtek, igy egy hosszan futo szerveren (pl. ingyenes
+   * Render-instance-on) minden lejatszott (vagy AI-vs-AI-ra fajult, majd
+   * vegigjatszodott) parti vegleg memoriaban maradt - lassu, de valodi
+   * memoriaszivargas. Mostantol MINDEN meccs-lezarasi utvonal (idokorlat,
+   * lancolt AI-lepes, ES egy ember sajat lepese altal okozott gyozelem/
+   * dontetlen/feladas is - lasd applyMove/server.js) ezen a kozponti ponton
+   * megy at, ugyanugy, mint a korabban is csak itt hasznalt destroyRoom().
+   */
   _endMatch(room) {
     if (room.timerHandle) {
       clearInterval(room.timerHandle);
@@ -417,8 +442,24 @@ class RoomManager {
     });
     for (const pNum of [1, 2]) {
       const p = room.players[pNum];
-      if (p && p.sessionToken) this.tokenToRoom.delete(p.sessionToken);
+      if (!p) continue;
+      if (p.sessionToken) this.tokenToRoom.delete(p.sessionToken);
+      if (p.socketId && this.socketToRoom.get(p.socketId) === room.roomId) {
+        this.socketToRoom.delete(p.socketId);
+      }
     }
+    this.rooms.delete(room.roomId);
+  }
+
+  /**
+   * Publikus wrapper az _endMatch korul - ezt hivja a server.js akkor, ha egy
+   * ember altal kezdemenyezett lepes (gyozelem/dontetlen/feladas) veget vetett
+   * a meccsnek, MIUTAN mar kikuldte a sajat state:update esemenyet (fontos a
+   * sorrend: a kliens eloszor a vegso allapotot lassa, utana a match:end-et -
+   * ugyanez a sorrend, mint az idokorlat- es AI-lancolt lezarasi utvonalon).
+   */
+  endMatch(room) {
+    this._endMatch(room);
   }
 
   destroyRoom(roomId) {
