@@ -134,10 +134,12 @@ function createServer({
         }
         io.to(room.roomId).emit('state:update', { state: room.state, cause: action, result });
         if (room.state.status !== 'playing') {
-          io.to(room.roomId).emit('match:end', {
-            status: room.state.status,
-            winner: room.state.winner,
-          });
+          // A meccs-lezaras kozponti helye a RoomManager._endMatch (lasd ott
+          // a 2026-08-31-i megjegyzest) - ez vegzi a match:end kikuldeset ES
+          // a teljes takaritast (tokenek, szoba, socket-terkepek), igy ez az
+          // utvonal (ember sajat lepese altal okozott gyozelem/dontetlen/
+          // feladas) ugyanugy takarit, mint az idokorlat- es AI-lancolt utvonal.
+          rooms.endMatch(room);
         }
       };
     }
