@@ -19,11 +19,22 @@ const ai = require('./ai/ai.js');
 const TURN_SECONDS = 60;
 const MAX_MISSED_TURNS = 3;
 const AI_DIFFICULTY = 'easy';
+// 2026-08-31 (felhasznaloi visszajelzes alapjan, elso elesben tesztelt online
+// partibol): a lancolt AI-lepesek (lasd _maybeAutoPlayAiTurns) korabban
+// TELJESEN azonnal, az ora barmilyen lathato pergese nelkul tortentek - ez
+// szandekos volt (hogy ne kelljen egy teljes percet varni), de a felhasznalo
+// visszajelzese szerint zavaro volt latni, hogy az orak "nem szamolnak". Ez a
+// mesterseges (dontesen MAR TULJUTOTT, csak a megjelenitest kesleltetŐ)
+// varakozas oldja ezt fel: az AI a lepeset valojaban ugyanugy AZONNAL
+// kiszamolja, csak a kozlese/megjelenitese kesik ennyit - igy az orak
+// lathatoan pergenek nehany masodpercet, de nem kell egy teljes kort varni.
+const AI_MOVE_DELAY_MS = 2500;
 
 class RoomManager {
-  constructor(io, { turnSeconds = TURN_SECONDS } = {}) {
+  constructor(io, { turnSeconds = TURN_SECONDS, aiMoveDelayMs = AI_MOVE_DELAY_MS } = {}) {
     this.io = io;
     this.turnSeconds = turnSeconds;
+    this.aiMoveDelayMs = aiMoveDelayMs;
     this.waiting = null; // { socketId, displayName } | null
     this.rooms = new Map(); // roomId -> RoomState
     this.socketToRoom = new Map(); // socketId -> roomId
@@ -342,21 +353,33 @@ class RoomManager {
   }
 
   /**
-   * Amig a soron levo jatekos AI-vezerelt es a meccs meg tart, azonnal
-   * (az ora lejarta nelkul) lejatssza az AI lepeset, es kozvetiti az
-   * eredmenyt. Igy ha mindket oldalt atvette mar a gep, a partit nem kell
-   * vegigvarni idokorlatonkent - a gep a maga koret azonnal leteszi.
+   * Amig a soron levo jatekos AI-vezerelt es a meccs meg tart, lejatssza az
+   * AI lepeset (nem varva a teljes korido lejartat), es kozvetiti az
+   * eredmenyt - igy ha mindket oldalt atvette mar a gep, a partit nem kell
+   * vegigvarni idokorlatonkent. A lepes megjelenitese elott (a dontes maga
+   * mar kesz) `aiMoveDelayMs`-nyit szandekosan var - lasd AI_MOVE_DELAY_MS
+   * fenti magyarazata -, hogy az ora lathatoan is pergjen egy kicsit, ne
+   * tunjon ugy, mintha "nem szamolna". Tesztekben `aiMoveDelayMs: 0`-val
+   * hivhato, ekkor teljesen szinkron/azonnal marad (a korabbi viselkedes).
    */
-  _maybeAutoPlayAiTurns(room) {
+  _maybeAutoPlayAiTurns(room, guard = 0) {
     const state = room.state;
-    let guard = 0;
-    while (
-      state.status === 'playing' &&
-      room.players[state.currentPlayer] &&
-      room.players[state.currentPlayer].aiControlled &&
-      guard < 200
+    if (
+      state.status !== 'playing' ||
+      !room.players[state.currentPlayer] ||
+      !room.players[state.currentPlayer].aiControlled ||
+      guard >= 200
     ) {
-      guard++;
+      return;
+    }
+
+    const playAndContinue = () => {
+      // A kesleltetes alatt a meccs allapota megvaltozhatott (pl. az ellenfel
+      // barmikor feladhatja a partit, fuggetlenul attol, ki van soron - lasd
+      // applyMove resign-kivetele) - ekkor itt mar nincs mit tenni.
+      const current = room.players[room.state.currentPlayer];
+      if (room.state.status !== 'playing' || !current || !current.aiControlled) return;
+
       const move = ai.chooseAiMove(state, { difficulty: AI_DIFFICULTY });
       let result;
       if (move && move.primary && move.secondary) {
@@ -364,17 +387,21 @@ class RoomManager {
       } else {
         result = engine.handleTimeout(state);
       }
-      if (!result || !result.ok) {
-        // Nincs ervenyes lepes (elvileg nem szabadna elofordulnia, amig
-        // 'playing' az allapot) - inkabb leallunk, mint vegtelen ciklus.
-        break;
-      }
+      if (!result || !result.ok) return; // nem tortenhet meg 'playing' allapotban - biztonsagi halo
+
       this.io.to(room.roomId).emit('state:update', { state: room.state, cause: 'ai-move', result });
       if (state.status !== 'playing') {
         this._endMatch(room);
         return;
       }
       this._resetTurnTimer(room);
+      this._maybeAutoPlayAiTurns(room, guard + 1);
+    };
+
+    if (this.aiMoveDelayMs > 0) {
+      setTimeout(playAndContinue, this.aiMoveDelayMs);
+    } else {
+      playAndContinue();
     }
   }
 
