@@ -80,6 +80,8 @@ function createServer({
             sessionToken: room.players[pNum].sessionToken,
             aiControlled: room.players[pNum].aiControlled,
             opponentAiControlled: room.players[opponentNum].aiControlled,
+            missedTurns: rooms.getMissedTurnsSnapshot(room),
+            aiDifficulty: rooms.aiDifficulty,
           });
         }
       }
@@ -102,6 +104,8 @@ function createServer({
         sessionToken: room.players[playerNumber].sessionToken,
         aiControlled,
         opponentAiControlled: room.players[opponentNum].aiControlled,
+        missedTurns: rooms.getMissedTurnsSnapshot(room),
+        aiDifficulty: rooms.aiDifficulty,
         rejoined: true,
       });
       const opponentSocket = io.sockets.sockets.get(room.players[opponentNum].socketId);
@@ -129,10 +133,20 @@ function createServer({
         // lat elore - csak a kesz lepespart, egyszerre. (Felhasznaloi
         // visszajelzes alapjan, elso elesben tesztelt online partibol.)
         if (action === 'primary' || action === 'retract') {
-          socket.emit('state:update', { state: room.state, cause: action, result });
+          socket.emit('state:update', {
+            state: room.state,
+            cause: action,
+            result,
+            missedTurns: rooms.getMissedTurnsSnapshot(room),
+          });
           return;
         }
-        io.to(room.roomId).emit('state:update', { state: room.state, cause: action, result });
+        io.to(room.roomId).emit('state:update', {
+          state: room.state,
+          cause: action,
+          result,
+          missedTurns: rooms.getMissedTurnsSnapshot(room),
+        });
         if (room.state.status !== 'playing') {
           // A meccs-lezaras kozponti helye a RoomManager._endMatch (lasd ott
           // a 2026-08-31-i megjegyzest) - ez vegzi a match:end kikuldeset ES

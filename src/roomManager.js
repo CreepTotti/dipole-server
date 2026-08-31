@@ -35,10 +35,28 @@ class RoomManager {
     this.io = io;
     this.turnSeconds = turnSeconds;
     this.aiMoveDelayMs = aiMoveDelayMs;
+    // 2026-08-31 (felhasznaloi visszajelzes alapjan - "x/3 auto-lepes" es "AI
+    // - (szint)" kliens-oldali kijelzes): a szerveroldali AI-nehezseg
+    // publikusan is olvashato property-kent, hogy a server.js (match:start/
+    // rejoin kiuldesekor) es a kliens (App.js) is ugyanazt a forras-erteket
+    // lassa, ne kulon hardcode-olt masolatot.
+    this.aiDifficulty = AI_DIFFICULTY;
     this.waiting = null; // { socketId, displayName } | null
     this.rooms = new Map(); // roomId -> RoomState
     this.socketToRoom = new Map(); // socketId -> roomId
     this.tokenToRoom = new Map(); // sessionToken -> { roomId, playerNumber }
+  }
+
+  /**
+   * Mindket jatekos aktualis kihagyott-kor-szamlaloja - a kliens ebbol
+   * jeleníti meg az "x/3" auto-lepes jelzest (lasd App.js PlayerPanel
+   * `missedTurns` propja). Csak online modban ertelmezett fogalom.
+   */
+  getMissedTurnsSnapshot(room) {
+    return {
+      1: room.players[1] ? room.players[1].missedTurns : 0,
+      2: room.players[2] ? room.players[2].missedTurns : 0,
+    };
   }
 
   /** Belepes a matchmaking sorba. Ha mar var valaki, azonnal parositunk. */
@@ -282,6 +300,7 @@ class RoomManager {
         this.io.to(room.roomId).emit('player:ai-takeover', {
           playerNumber: expiredPlayerNumber,
           displayName: expiredPlayer.displayName,
+          aiDifficulty: this.aiDifficulty,
         });
       }
     }
@@ -305,7 +324,12 @@ class RoomManager {
       result = engine.handleTimeout(state);
     }
 
-    this.io.to(room.roomId).emit('state:update', { state: room.state, cause: 'timeout', result });
+    this.io.to(room.roomId).emit('state:update', {
+      state: room.state,
+      cause: 'timeout',
+      result,
+      missedTurns: this.getMissedTurnsSnapshot(room),
+    });
 
     if (state.status !== 'playing') {
       this._endMatch(room);
@@ -400,7 +424,12 @@ class RoomManager {
       }
       if (!result || !result.ok) return; // nem tortenhet meg 'playing' allapotban - biztonsagi halo
 
-      this.io.to(room.roomId).emit('state:update', { state: room.state, cause: 'ai-move', result });
+      this.io.to(room.roomId).emit('state:update', {
+        state: room.state,
+        cause: 'ai-move',
+        result,
+        missedTurns: this.getMissedTurnsSnapshot(room),
+      });
       if (state.status !== 'playing') {
         this._endMatch(room);
         return;

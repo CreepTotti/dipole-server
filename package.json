@@ -6,7 +6,13 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test:simulate": "node test/simulate-match.js"
+    "test:simulate": "node test/simulate-match.js",
+    "test:timeout": "node test/simulate-timeout.js",
+    "test:ai-takeover": "node test/simulate-ai-takeover.js",
+    "test:ai-move-delay": "node test/simulate-ai-move-delay.js",
+    "test:turn-timer": "node test/simulate-turn-timer.js",
+    "test:double-ai-takeover": "node test/simulate-double-ai-takeover.js",
+    "test:client-metadata": "node test/simulate-client-metadata.js"
   },
   "dependencies": {
     "socket.io": "^4.8.3",
