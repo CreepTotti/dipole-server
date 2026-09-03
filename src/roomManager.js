@@ -19,6 +19,14 @@ const ai = require('./ai/ai.js');
 const TURN_SECONDS = 60;
 const MAX_MISSED_TURNS = 3;
 const AI_DIFFICULTY = 'easy';
+// 2026-08-31 (felhasznaloi keresre): kulon "Online AI teszt" jatekmod - egy
+// KULON matchmaking-sorban var (lasd waitingByMode), es a belole letrejovo
+// szobak ezekkel a (a normal online modtol teljesen fuggetlen) beallitasokkal
+// futnak - lasd joinQueue. A cel: gyorsan, fejlesztoi/tesztelesi celra
+// eljuttatni a partit odaig, hogy mindket oldalt egy-egy ERŐS AI jatssza -
+// lasd MAX_MISSED_TURNS fent (ez valtozatlan, 3 marad mindket modban).
+const AI_TEST_TURN_SECONDS = 1;
+const AI_TEST_AI_DIFFICULTY = 'hard';
 // 2026-08-31 (felhasznaloi visszajelzes alapjan, elso elesben tesztelt online
 // partibol): a lancolt AI-lepesek (lasd _maybeAutoPlayAiTurns) korabban
 // TELJESEN azonnal, az ora barmilyen lathato pergese nelkul tortentek - ez
@@ -41,7 +49,10 @@ class RoomManager {
     // rejoin kiuldesekor) es a kliens (App.js) is ugyanazt a forras-erteket
     // lassa, ne kulon hardcode-olt masolatot.
     this.aiDifficulty = AI_DIFFICULTY;
-    this.waiting = null; // { socketId, displayName } | null
+    // Ket FUGGETLEN matchmaking-sor: a normal "online" es a kulon "ai-test"
+    // ("Online AI teszt") sor SOHA nem parosodik ossze egymassal - lasd
+    // joinQueue. Korabban egyetlen `this.waiting` mezo volt csak.
+    this.waitingByMode = { online: null, 'ai-test': null }; // mode -> { socketId, displayName } | null
     this.rooms = new Map(); // roomId -> RoomState
     this.socketToRoom = new Map(); // socketId -> roomId
     this.tokenToRoom = new Map(); // sessionToken -> { roomId, playerNumber }
@@ -59,28 +70,45 @@ class RoomManager {
     };
   }
 
-  /** Belepes a matchmaking sorba. Ha mar var valaki, azonnal parositunk. */
-  joinQueue(socket, displayName) {
+  /**
+   * Belepes a matchmaking sorba. Ha mar var valaki UGYANEBBEN a sorban
+   * (`mode`), azonnal parositunk - a ket sor ('online' es 'ai-test')
+   * teljesen fuggetlen, egymassal SOHA nem parosodnak (lasd waitingByMode).
+   */
+  joinQueue(socket, displayName, mode) {
+    const normalizedMode = mode === 'ai-test' ? 'ai-test' : 'online';
     if (this.socketToRoom.has(socket.id)) {
       return { ok: false, error: 'already-in-match' };
     }
 
-    if (!this.waiting) {
-      this.waiting = { socketId: socket.id, displayName: displayName || 'Jatekos 1' };
+    const waitingSlot = this.waitingByMode[normalizedMode];
+    if (!waitingSlot) {
+      this.waitingByMode[normalizedMode] = { socketId: socket.id, displayName: displayName || 'Jatekos 1' };
       return { ok: true, status: 'waiting' };
     }
 
-    if (this.waiting.socketId === socket.id) {
+    if (waitingSlot.socketId === socket.id) {
       return { ok: false, error: 'already-waiting' };
     }
 
-    const p1 = this.waiting;
-    this.waiting = null;
+    const p1 = waitingSlot;
+    this.waitingByMode[normalizedMode] = null;
     const roomId = crypto.randomUUID();
+    const isTestMode = normalizedMode === 'ai-test';
 
     const state = engine.createGameState();
     const room = {
       roomId,
+      mode: normalizedMode,
+      testMode: isTestMode,
+      // 2026-08-31 (felhasznaloi keresre, "Online AI teszt"): ezek a
+      // beallitasok SZOBANKENT rogzulnek a letrehozaskor, fuggetlenul a
+      // szerver egyeb (normal online) szobaitol - lasd _startTurnTimer/
+      // _onTick/_maybeAutoPlayAiTurns, amik mar `room.turnSeconds`/
+      // `room.aiDifficulty`-t hasznaljak `this.turnSeconds`/`this.aiDifficulty`
+      // helyett.
+      turnSeconds: isTestMode ? AI_TEST_TURN_SECONDS : this.turnSeconds,
+      aiDifficulty: isTestMode ? AI_TEST_AI_DIFFICULTY : this.aiDifficulty,
       state,
       players: {
         1: {
@@ -246,9 +274,11 @@ class RoomManager {
    * nem zarjuk be es a tokent sem toroljuk itt.
    */
   handleDisconnect(socketId) {
-    if (this.waiting && this.waiting.socketId === socketId) {
-      this.waiting = null;
-      return null;
+    for (const modeKey of Object.keys(this.waitingByMode)) {
+      if (this.waitingByMode[modeKey] && this.waitingByMode[modeKey].socketId === socketId) {
+        this.waitingByMode[modeKey] = null;
+        return null;
+      }
     }
     const room = this.getRoomBySocket(socketId);
     if (!room) return null;
@@ -260,12 +290,12 @@ class RoomManager {
   }
 
   _startTurnTimer(room) {
-    room.state.timer = this.turnSeconds;
+    room.state.timer = room.turnSeconds;
     room.timerHandle = setInterval(() => this._onTick(room), 1000);
   }
 
   _resetTurnTimer(room) {
-    room.state.timer = this.turnSeconds;
+    room.state.timer = room.turnSeconds;
   }
 
   _onTick(room) {
@@ -284,23 +314,43 @@ class RoomManager {
     const expiredPlayer = room.players[expiredPlayerNumber];
     const phaseAtExpiry = state.phase;
 
-    if (expiredPlayer) {
+    if (expiredPlayer && !expiredPlayer.aiControlled) {
+      // A kihagyott-kor-szamlalot SZANDEKOSAN csak addig noveljuk, amig a
+      // jatekos meg NEM AI-vezerelt - miutan atvette a gep, ez a szamlalo
+      // mar nem jelent semmit (a szamlalasnak a "3 kihagyott kor -> atvetel"
+      // dontes volt a celja). 2026-08-31 (az "Online AI teszt" mod
+      // bevezetesekor feltart, korabban rejtve maradt aprosag): korabban ez
+      // FELTETEL NELKUL, minden lejart kornel novekedett, meg akkor is, ha a
+      // jatekos mar regen AI-vezerelt volt - normal (60mp-es) modban ez
+      // ritkan tunt fel (egy AI-atvett oldal nem sok tovabbi kort er meg egy
+      // 60mp-es partiban), de az uj, 1mp-es koridovel futo teszt-modban
+      // percek alatt ertelmetlenul magasra (pl. "47/3") futott volna fel a
+      // kliens "⏭ x/3" kijelzese - lasd App.js PlayerPanel.
       expiredPlayer.missedTurns += 1;
-      if (!expiredPlayer.aiControlled && expiredPlayer.missedTurns >= MAX_MISSED_TURNS) {
+      if (expiredPlayer.missedTurns >= MAX_MISSED_TURNS) {
         expiredPlayer.aiControlled = true;
-        // FONTOS: az atvett jatekost AZONNAL, teljesen ki kell zarni a
-        // partibol - meg nezokent (spectator) sem terhet vissza, es semmit
-        // nem kattinthat (meg a feladast sem). Ez azert szandekos ilyen
-        // szigoru, mert a masik jatekos szamara az AI-jatszma gyozelme
-        // (kesobbi funkciokent) jutalmat/statisztikat old fel - ezt nem
-        // akadalyozhatja meg az, akit ledobott a halozat vagy nem lepett
-        // idoben. Ezert a kiutasitas MEGELOZI a szoba-szintu ertesitest,
-        // hogy o mar ne is kapja meg azt.
-        this._evictAiControlledPlayer(room, expiredPlayerNumber);
+        if (!room.testMode) {
+          // FONTOS (csak NORMAL online modban): az atvett jatekost AZONNAL,
+          // teljesen ki kell zarni a partibol - meg nezokent (spectator) sem
+          // terhet vissza, es semmit nem kattinthat (meg a feladast sem). Ez
+          // azert szandekos ilyen szigoru, mert a masik jatekos szamara az
+          // AI-jatszma gyozelme (kesobbi funkciokent) jutalmat/statisztikat
+          // old fel - ezt nem akadalyozhatja meg az, akit ledobott a halozat
+          // vagy nem lepett idoben. Ezert a kiutasitas MEGELOZI a
+          // szoba-szintu ertesitest, hogy o mar ne is kapja meg azt.
+          this._evictAiControlledPlayer(room, expiredPlayerNumber);
+        }
+        // 2026-08-31 (felhasznaloi keresre, "Online AI teszt"): teszt modban
+        // a fenti kiutasitas ELMARAD, tehat az erintett jatekos szocketje
+        // BENNMARAD a szobaban - ez az esemeny ekkor MINDKET oldalhoz eljut
+        // (a sajat magat erinto atvetelrol is ertesul, lasd App.js
+        // `player:ai-takeover` kezelojet), es o maga tovabbra is nezokent
+        // (spectator) folytathatja a mar folyamatban levo (vagy hamarosan
+        // mindket oldalon gep altal jatszott) partit.
         this.io.to(room.roomId).emit('player:ai-takeover', {
           playerNumber: expiredPlayerNumber,
           displayName: expiredPlayer.displayName,
-          aiDifficulty: this.aiDifficulty,
+          aiDifficulty: room.aiDifficulty,
         });
       }
     }
@@ -314,7 +364,7 @@ class RoomManager {
     let result;
     let usedAiChoice = false;
     if (expiredPlayer && expiredPlayer.aiControlled && phaseAtExpiry === 'primary') {
-      const move = ai.chooseAiMove(state, { difficulty: AI_DIFFICULTY });
+      const move = ai.chooseAiMove(state, { difficulty: room.aiDifficulty });
       if (move && move.primary && move.secondary) {
         result = this._applyPair(state, move.primary, move.secondary);
         usedAiChoice = true;
@@ -322,6 +372,25 @@ class RoomManager {
     }
     if (!usedAiChoice) {
       result = engine.handleTimeout(state);
+    }
+
+    // 2026-09-03 (az "Online AI teszt" mod hibakeresesekor feltart, korabban
+    // rejtve maradt hiba): a fenti handleTimeout/_applyPair mar meghivta az
+    // engine belso switchPlayer()-jet, ami a `state.timer`-t egy SAJAT,
+    // fixen bedrotozott 60-ra allitja (ez az engine altalanos, szoba-fuggetlen
+    // alapertelmezese - lasd engine/board.js switchPlayer). Normal (60mp-es)
+    // modban ez veletlenul egybeesik a szoba tenyleges koridovel, tehat
+    // eszrevehetetlen volt - DE az uj, 1mp-es "Online AI teszt" modban ez azt
+    // okozta, hogy minden egyes lejart kor utan a klienseknek kikuldott
+    // 'state:update' PILLANATNYILAG (tevesen) "60"-at mutatott a tenyleges
+    // 1 helyett, egeszen a legkozelebbi 'timer:tick'-ig - ami 1mp-es
+    // koridonel SOHA nem jott meg (minden egyes tick azonnal ujra lejar, egy
+    // ujabb 'state:update'-et valtva ki, ugyanezzel a hibaval). A javitas:
+    // a szoba-specifikus koridot MAR AZ EMITTALAS ELOTT visszaallitjuk, hogy
+    // a kliensek altal latott `state.timer` mindig a tenyleges (`room.
+    // turnSeconds`) erteket tukrozze, ne az engine altalanos alapertelmezeset.
+    if (state.status === 'playing') {
+      this._resetTurnTimer(room);
     }
 
     this.io.to(room.roomId).emit('state:update', {
@@ -335,7 +404,6 @@ class RoomManager {
       this._endMatch(room);
       return;
     }
-    this._resetTurnTimer(room);
     // Ha az idokorlat lejarta utan soron kovetkezo fel is mar AI-vezerelt
     // (pl. mindket oldal atadva a gepnek), a lanc azonnal folytatodjon.
     this._maybeAutoPlayAiTurns(room);
@@ -398,6 +466,17 @@ class RoomManager {
    * hivhato, ekkor teljesen szinkron/azonnal marad (a korabbi viselkedes).
    */
   _maybeAutoPlayAiTurns(room, guard = 0) {
+    // 2026-08-31 (felhasznaloi keresre, "Online AI teszt"): teszt modban ez
+    // a lanc-optimalizacio SZANDEKOSAN nem fut - az itt hasznalt
+    // `aiMoveDelayMs`-es kesleltetes fuggetlen a szoba sajat, nagyon rovid
+    // (1mp-es) koridojatol, es a ket idozito versenyezne egymassal (ugyanazt
+    // a lepest ketszer probalna meg alkalmazni). Teszt modban emiatt
+    // KIZAROLAG az _onTick sajat, koridohoz kotott utja jatssza le az AI
+    // lepeseit - ez egyben pontosan a kivant, "vegig kovetheto" (kb.
+    // masodpercenkent egy lepes) temp ot is adja az AI-AI osszecsapashoz,
+    // nem egy szempillantas alatt lezajlo, kovethetetlen lancot.
+    if (room.testMode) return;
+
     const state = room.state;
     if (
       state.status !== 'playing' ||
@@ -415,7 +494,7 @@ class RoomManager {
       const current = room.players[room.state.currentPlayer];
       if (room.state.status !== 'playing' || !current || !current.aiControlled) return;
 
-      const move = ai.chooseAiMove(state, { difficulty: AI_DIFFICULTY });
+      const move = ai.chooseAiMove(state, { difficulty: room.aiDifficulty });
       let result;
       if (move && move.primary && move.secondary) {
         result = this._applyPair(state, move.primary, move.secondary);
@@ -423,6 +502,13 @@ class RoomManager {
         result = engine.handleTimeout(state);
       }
       if (!result || !result.ok) return; // nem tortenhet meg 'playing' allapotban - biztonsagi halo
+
+      // Lasd a fenti (2026-09-03) megjegyzest az _onTick-ben - ugyanaz az
+      // engine switchPlayer() altal okozott, korabban rejtve maradt hiba:
+      // az ora-ujrainditasnak MEG AZ EMITTALAS ELOTT meg kell tortennie.
+      if (state.status === 'playing') {
+        this._resetTurnTimer(room);
+      }
 
       this.io.to(room.roomId).emit('state:update', {
         state: room.state,
@@ -434,7 +520,6 @@ class RoomManager {
         this._endMatch(room);
         return;
       }
-      this._resetTurnTimer(room);
       this._maybeAutoPlayAiTurns(room, guard + 1);
     };
 
