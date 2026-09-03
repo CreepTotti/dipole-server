@@ -49,6 +49,12 @@ function createServer({
     ...(turnSeconds !== undefined ? { turnSeconds } : {}),
     ...(aiMoveDelayMs !== undefined ? { aiMoveDelayMs } : {}),
   });
+  // 2026-09-03 (aszinkron AI-szamitas - lasd roomManager.js aiPool): a
+  // RoomManager sajat worker-pool-ot indit az AI-dontesekhez - ezt a
+  // httpServer lezarasakor (production leallaskor, illetve tesztekben
+  // minden egyes httpServer.close() hivasnal) rendezetten le kell allitani,
+  // kulonben a worker-szalak feleslegesen elve maradnanak.
+  httpServer.on('close', () => rooms.shutdownAiPool());
 
   io.on('connection', (socket) => {
     socket.on('queue:join', ({ displayName, mode } = {}) => {
