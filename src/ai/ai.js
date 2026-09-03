@@ -1120,21 +1120,50 @@ function chooseAiMove(state, { difficulty = 'medium', rng = Math.random, weights
   let bestSafePair = null;
   let bestSafeValue = -Infinity;
 
+  // SORREND-CSERE (2026-09-03, 5. kor - felhasznaloi kiertekeles alapjan):
+  // korabban ez EGYETLEN korben, jeloltenkent egymas utan futtatta le eloszor
+  // a draga negamax-ertekelest, es CSAK AZUTAN a vedekezo findForcedWin
+  // ellenorzest ugyanarra a jeloltre. Igy a top-3 jelolt kozul a KESOBB sorra
+  // kerulok vedekezo ellenorzese mar csak a korabbi jeloltek negamax-ideje
+  // UTAN megmaradt, egyre szukebb reszet kapta a kozos `deadline`-bol - ez
+  // hamis "biztonsagos" (found:false, csak idohiany miatt) eredmenyt okozhat
+  // pont ott, ahol a legfontosabb lenne pontosnak lennie. A 6 valos
+  // kiertekelo-meccsen vegzett elemzes szerint ez a maradek, idozitesbol
+  // fakado hibak koznos oka (lasd a felhasznaloval megbeszelt ~1/3-os
+  // maradek arany).
+  //
+  // Az itt kovetkezo ket kulon kor ezt oldja meg: ELOSZOR mindharom jelolt
+  // vedekezo ellenorzeset vegezzuk el (meg a negamax elott, tehat a meg
+  // teljesen friss `deadline`-bol), es CSAK EZUTAN jon a negamax-alapu
+  // ertekeles/rangsorolas. Igy egyetlen jelolt biztonsagi eredmenye sem
+  // fugghet attol, mennyi idot ettek fel elotte MAS jeloltek negamax-hivasai
+  // - legrosszabb esetben a rangsoroshoz hasznalt `value` csonkulhat egy
+  // kesoi jeloltnel (a negamax sajat idokorlat-ellenorzese miatt 0-ra esik
+  // vissza), de ez sokkal kisebb baj, mint egy NEM biztonsagos lepes
+  // tevedesbol biztonsagosnak minositese. Korlatlan idovel (nincs idonyomas)
+  // a ket sorrend PONTOSAN ugyanazt az eredmenyt adja, hiszen a negamax es a
+  // findForcedWin egymastol fuggetlen szamitasok ugyanazon a `sim`
+  // allapoton - csak idonyomas alatt terhet el a viselkedes, szandekosan.
+  const prepared = [];
   for (const cand of top) {
     const sim = cloneState(state);
     const res = applyPair(sim, mover, cand.primary, cand.secondary);
     if (!res.ok) continue;
 
-    let value;
     let leavesOpponentForcedWin = false;
+    if (sim.status === 'playing' && checkDefensiveThreat) {
+      leavesOpponentForcedWin = findForcedWin(sim, otherPlayer(mover), { ...THREAT_SEARCH_OPTS, deadline }).found;
+    }
+    prepared.push({ cand, sim, leavesOpponentForcedWin });
+  }
+
+  for (const { cand, sim, leavesOpponentForcedWin } of prepared) {
+    let value;
     if (sim.status !== 'playing') {
       if (sim.status === 'draw') value = 0;
       else value = sim.winner === mover ? WIN_SCORE : -WIN_SCORE;
     } else {
       value = cand.score - negamax(sim, otherPlayer(mover), settings.depthPlies - 1, -Infinity, Infinity, searchSettings, effectiveWeights);
-      if (checkDefensiveThreat) {
-        leavesOpponentForcedWin = findForcedWin(sim, otherPlayer(mover), { ...THREAT_SEARCH_OPTS, deadline }).found;
-      }
     }
 
     if (value > bestValue) {
