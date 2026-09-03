@@ -12,7 +12,9 @@
     "test:ai-move-delay": "node test/simulate-ai-move-delay.js",
     "test:turn-timer": "node test/simulate-turn-timer.js",
     "test:double-ai-takeover": "node test/simulate-double-ai-takeover.js",
-    "test:client-metadata": "node test/simulate-client-metadata.js"
+    "test:client-metadata": "node test/simulate-client-metadata.js",
+    "test:ai-test-mode": "node test/simulate-ai-test-mode.js",
+    "test:ai-time-budget": "node test/simulate-ai-time-budget.js"
   },
   "dependencies": {
     "socket.io": "^4.8.3",
