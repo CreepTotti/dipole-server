@@ -51,6 +51,29 @@ const {
 
 const WIN_SCORE = 10000000;
 
+// 2026-09-03 (felhasznaloi hibajelzes alapjan, "Online AI teszt" modban
+// eszlelt szerver-lefagyas/kapcsolat-megszakadas): a szerver EGYETLEN
+// Node-folyamatban, EGY szalon fut - ha egy chooseAiMove hivas (kulonosen
+// "hard" szinten, mely negamax-lookahead + fenyegetes-lanc kereses) tul
+// sokaig szamol szinkron modon, az BLOKKOLJA az egesz szervert (minden
+// szoba, minden kapcsolat socket.io szivveres-kezelese is befagy erre az
+// idore). Egy hosszan elhuzodo, kiegyenlitett AI-AI osszecsapasban (sok
+// korrel, sok mar lerakott koveel a tablan, senki nem hibazik ki egy
+// gyors gyozelmet) ez a szamitasi koltseg alkalmankent tobb masodpercre is
+// felszokhet - ez mar meghaladhatja a kliensek szivveres-turelmet, es
+// lathato ("a szerver megszakadt") kapcsolat-vesztest okoz MINDEN
+// csatlakozott klliensnek, nem csak az erintett szobaban.
+// Ez a vedelmi hatarido (wall-clock deadline, NEM csomopont-szamlalo, mint
+// a mar meglevo `nodeBudget`) biztositja, hogy egyetlen dontes se tarthasson
+// ennel tovabb - ha lejar, a mely kereses (negamax es findForcedWin egyarant)
+// egyszeruen leall, es a mar addig ismert legjobb heurisztikus becslesre esik
+// vissza, ahelyett hogy a vegtelensegig (vagy csak nagyon sokaig) szamolna.
+// Az ertek jóval a dokumentalt tipikus koltseg (~450-860ms "hard" negamax)
+// folott van, hogy normal/tipikus allasokon (es egy kicsit lassabb, terhelt
+// gepen/CI-n) SOHA ne aktivalodjon - kizarolag a valodi, patologikus
+// szelsoertekeket vagja el. Lasd chooseAiMove, negamax, findForcedWin.
+const DEFAULT_TIME_BUDGET_MS = 2500;
+
 // A spec "Pontertekelesi tablazata" (checkLine eredmenye alapjan).
 // Kulcs: `${count}|${gaps}|${openEnds}`
 const SCORE_TABLE = {
@@ -588,6 +611,11 @@ function pickRandomWeights(difficulty, rng) {
  */
 function negamax(state, mover, depth, alpha, beta, settings, weights) {
   if (state.status !== 'playing' || depth === 0) return 0;
+  // Lasd DEFAULT_TIME_BUDGET_MS fenti magyarazata: ha a dontesre szant
+  // idokeret mar lejart, itt is ugyanugy leallunk, mintha elertuk volna a
+  // keresesi melyseg aljat (0-t adva vissza) - a hivo a mar addig ismert
+  // heurisztikus (mely-kereses nelkuli) ertekre esik vissza.
+  if (settings.deadline && Date.now() > settings.deadline) return 0;
 
   const candidates = getBorderCells(state, settings.extendedRadius);
   const pairs = evaluateBestPairsForMover(state, mover, candidates, weights);
@@ -759,6 +787,10 @@ function findForcedWin(state, mover, opts = {}) {
   const maxPly = opts.maxPly ?? THREAT_SEARCH_OPTS.maxPly;
   const nodeBudget = opts.nodeBudget ?? THREAT_SEARCH_OPTS.nodeBudget;
   const candidateRadius = opts.candidateRadius ?? THREAT_SEARCH_OPTS.candidateRadius;
+  // Lasd DEFAULT_TIME_BUDGET_MS fenti magyarazata - opcionalis, abszolut
+  // (Date.now()-hoz viszonyitott) wall-clock hatarido, a mar meglevo
+  // `nodeBudget`-tol fuggetlenul.
+  const deadline = opts.deadline;
 
   const moverSymbols = PLAYER_SYMBOLS[mover];
   const oppPlayer = otherPlayer(mover);
@@ -770,7 +802,7 @@ function findForcedWin(state, mover, opts = {}) {
   function search(s, plyBudget) {
     if (timedOut) return { found: false };
     nodesUsed++;
-    if (nodesUsed > nodeBudget) {
+    if (nodesUsed > nodeBudget || (deadline && Date.now() > deadline)) {
       timedOut = true;
       return { found: false };
     }
@@ -970,7 +1002,7 @@ function isEarlyUndecidedPosition(state) {
 // (nem tavoli, hipotetikus jovobeli) taktikai ertek alapjan egyenrangu
 // jeloltek kozotti valasztas - a tavoli kulonbsegeket a "meg nem dolt el
 // semmi" fazisban szandekosan figyelmen kivul hagyjuk.
-function pickVariedOpeningPair(state, mover, pairs, rng) {
+function pickVariedOpeningPair(state, mover, pairs, rng, deadline) {
   const topScore = pairs[0].score;
   const tieGroup = pairs.filter((p) => p.score === topScore);
   if (tieGroup.length < 2) return null; // nincs valodi dontetlen - marad a szokasos, mely kereses
@@ -993,7 +1025,7 @@ function pickVariedOpeningPair(state, mover, pairs, rng) {
       safeCandidates.push(cand);
       continue;
     }
-    const leavesOpponentForcedWin = findForcedWin(sim, otherPlayer(mover), THREAT_SEARCH_OPTS).found;
+    const leavesOpponentForcedWin = findForcedWin(sim, otherPlayer(mover), { ...THREAT_SEARCH_OPTS, deadline }).found;
     if (!leavesOpponentForcedWin) safeCandidates.push(cand);
   }
 
@@ -1014,18 +1046,26 @@ function pickVariedOpeningPair(state, mover, pairs, rng) {
  * Visszaadja: { primary: {row,col}, secondary: {row,col} } vagy null, ha
  * nincs ervenyes lepes (nem tortenhet meg jatek kozben, lasd engine invariants).
  */
-function chooseAiMove(state, { difficulty = 'medium', rng = Math.random, weights } = {}) {
+function chooseAiMove(state, { difficulty = 'medium', rng = Math.random, weights, timeBudgetMs } = {}) {
   if (state.status !== 'playing') return null;
   const settings = DIFFICULTY_SETTINGS[difficulty] || DIFFICULTY_SETTINGS.medium;
   const mover = state.currentPlayer;
   const effectiveWeights = weights || pickRandomWeights(difficulty, rng);
+  // Lasd DEFAULT_TIME_BUDGET_MS fenti magyarazata: EGYETLEN, abszolut
+  // (Date.now()-hoz viszonyitott) hatarido ervenyes a dontes TELJES
+  // kiertekelesere (sajat kenyszerito-gyozelem-ellenorzes + negamax-lookahead
+  // + nyitasi/vedekezo biztonsagi ellenorzesek egyutt) - minden alkeresesnek
+  // UGYANAZT az erteket adjuk at, hogy azok osszesitett ideje se lephesse at
+  // a korlatot. `timeBudgetMs` kivulrol is felulirhato (pl. tesztekhez).
+  const deadline = Date.now() + (timeBudgetMs ?? DEFAULT_TIME_BUDGET_MS);
+  const searchSettings = { ...settings, deadline };
 
   // TAMADO FENYEGETES-ELLENORZES (mindharom nehezsegen): ha MAR MOST van
   // bizonyitottan kikenyszerithetu gyozelme a mover-nek, azt vegyuk el -
   // ezt nem szabad a heurisztikus pontozasra/topN-vagasra bizni, mert az
   // (kulonosen konnyű/kozepes szinten) egy valodi nyero lepest is
   // athagyhat. Lasd findForcedWin fenti magyarazata.
-  const ownForcedWin = findForcedWin(state, mover, THREAT_SEARCH_OPTS);
+  const ownForcedWin = findForcedWin(state, mover, { ...THREAT_SEARCH_OPTS, deadline });
   if (ownForcedWin.found) {
     const first = ownForcedWin.line[0];
     return { primary: first.primary, secondary: first.secondary, weightsUsed: effectiveWeights, viaForcedWin: true };
@@ -1043,7 +1083,7 @@ function chooseAiMove(state, { difficulty = 'medium', rng = Math.random, weights
   // pickVariedOpeningPair fenti magyarazata arrol, hogy miert a gyoker
   // `score`-on, nem a mely `value`-n alapul a dontetlen-detektalas.
   if (isEarlyUndecidedPosition(state)) {
-    const variedChoice = pickVariedOpeningPair(state, mover, pairs, rng);
+    const variedChoice = pickVariedOpeningPair(state, mover, pairs, rng, deadline);
     if (variedChoice) {
       return { primary: variedChoice.primary, secondary: variedChoice.secondary, weightsUsed: effectiveWeights };
     }
@@ -1072,9 +1112,9 @@ function chooseAiMove(state, { difficulty = 'medium', rng = Math.random, weights
       if (sim.status === 'draw') value = 0;
       else value = sim.winner === mover ? WIN_SCORE : -WIN_SCORE;
     } else {
-      value = cand.score - negamax(sim, otherPlayer(mover), settings.depthPlies - 1, -Infinity, Infinity, settings, effectiveWeights);
+      value = cand.score - negamax(sim, otherPlayer(mover), settings.depthPlies - 1, -Infinity, Infinity, searchSettings, effectiveWeights);
       if (checkDefensiveThreat) {
-        leavesOpponentForcedWin = findForcedWin(sim, otherPlayer(mover), THREAT_SEARCH_OPTS).found;
+        leavesOpponentForcedWin = findForcedWin(sim, otherPlayer(mover), { ...THREAT_SEARCH_OPTS, deadline }).found;
       }
     }
 
@@ -1104,6 +1144,10 @@ function chooseAiMove(state, { difficulty = 'medium', rng = Math.random, weights
 
 module.exports = {
   DIFFICULTY_SETTINGS,
+  // A 2026-09 worker-pool (lasd aiWorkerPool.js) ezt hasznalja a "worker
+  // lefagyott" biztonsagi-halo idozitesehez (a tenyleges egyuttmukodo
+  // hataridon FELUL, annak margojaval) - lasd ott a HANG_MARGIN_MS mellett.
+  DEFAULT_TIME_BUDGET_MS,
   scoreLineResult,
   cellValueFor,
   // "Konvergencia-pont" javitas - kulon exportalva, hogy onmagaban is
