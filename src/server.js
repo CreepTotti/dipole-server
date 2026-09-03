@@ -51,8 +51,8 @@ function createServer({
   });
 
   io.on('connection', (socket) => {
-    socket.on('queue:join', ({ displayName } = {}) => {
-      const result = rooms.joinQueue(socket, displayName);
+    socket.on('queue:join', ({ displayName, mode } = {}) => {
+      const result = rooms.joinQueue(socket, displayName, mode);
       if (!result.ok) {
         socket.emit('queue:error', { error: result.error });
         return;
@@ -74,6 +74,7 @@ function createServer({
           const opponentNum = pNum === 1 ? 2 : 1;
           s.emit('match:start', {
             roomId: room.roomId,
+            mode: room.mode,
             playerNumber: pNum,
             opponentName: room.players[opponentNum].displayName,
             state: room.state,
@@ -81,7 +82,7 @@ function createServer({
             aiControlled: room.players[pNum].aiControlled,
             opponentAiControlled: room.players[opponentNum].aiControlled,
             missedTurns: rooms.getMissedTurnsSnapshot(room),
-            aiDifficulty: rooms.aiDifficulty,
+            aiDifficulty: room.aiDifficulty,
           });
         }
       }
@@ -98,6 +99,7 @@ function createServer({
       const opponentNum = playerNumber === 1 ? 2 : 1;
       socket.emit('match:start', {
         roomId: room.roomId,
+        mode: room.mode,
         playerNumber,
         opponentName: room.players[opponentNum].displayName,
         state: room.state,
@@ -105,7 +107,7 @@ function createServer({
         aiControlled,
         opponentAiControlled: room.players[opponentNum].aiControlled,
         missedTurns: rooms.getMissedTurnsSnapshot(room),
-        aiDifficulty: rooms.aiDifficulty,
+        aiDifficulty: room.aiDifficulty,
         rejoined: true,
       });
       const opponentSocket = io.sockets.sockets.get(room.players[opponentNum].socketId);
