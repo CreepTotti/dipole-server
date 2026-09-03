@@ -14,7 +14,11 @@
 
 const crypto = require('crypto');
 const engine = require('./engine/board.js');
-const ai = require('./ai/ai.js');
+// 2026-09-03: a chooseAiMove() hivasok mostantol a worker poolon (lasd
+// this.aiPool lent) keresztul zajlanak - ez a modul mar nem hivja
+// kozvetlenul az ai.js-t, csak a poolt csomagolo aiWorkerPool.js-t (ami
+// maga a worker-szalon belul, kulon peldanyban tolti be az ai.js-t).
+const { AiWorkerPool } = require('./ai/aiWorkerPool.js');
 
 const TURN_SECONDS = 60;
 const MAX_MISSED_TURNS = 3;
@@ -56,6 +60,18 @@ class RoomManager {
     this.rooms = new Map(); // roomId -> RoomState
     this.socketToRoom = new Map(); // socketId -> roomId
     this.tokenToRoom = new Map(); // sessionToken -> { roomId, playerNumber }
+    // 2026-09-03 (felhasznaloi keresre: "kotelezo" aszinkron AI-szamitas -
+    // lasd aiWorkerPool.js fenti magyarazata): a tenyleges ai.chooseAiMove()
+    // hivasok mostantol EZEN a poolon (kulon worker_threads szalakon)
+    // keresztul futnak, SOSEM kozvetlenul, szinkron modon a fo szalon - igy
+    // egyetlen (akar sok szobaban egyszerre zajlo) AI-dontes sem blokkolhatja
+    // a szerver tobbi reszet (socket.io szivveres/minden mas szoba).
+    this.aiPool = new AiWorkerPool();
+  }
+
+  /** Szerver-leallaskor hivando: az osszes AI worker-szal rendezett leallitasa. */
+  shutdownAiPool() {
+    this.aiPool.shutdown();
   }
 
   /**
@@ -159,12 +175,31 @@ class RoomManager {
     const { playerNumber } = entry;
     const player = room.players[playerNumber];
 
-    // Ha a gep mar atvette ezt az oldalt (3 kihagyott kor), a token mar
-    // ervenytelen kellene legyen (lasd _evictAiControlledPlayer - onnan
-    // szandekosan toroljuk), de vedelmi retegkent itt is ellenorizzuk: ilyen
-    // jatekos SEM aktiv reszvevokent, SEM nezokent nem terhet vissza ehhez a
-    // partihoz - kikerul a "lobbyba" (a hivo/kliens friss sorbaallast indit).
-    if (player.aiControlled) {
+    // Ha a gep mar atvette ezt az oldalt (3 kihagyott kor):
+    //  - NORMAL online modban a token azonnal ervenytelen (lasd
+    //    _evictAiControlledPlayer - onnan szandekosan toroljuk), es
+    //    vedelmi retegkent itt is ellenorizzuk: ilyen jatekos SEM aktiv
+    //    reszvevokent, SEM nezokent nem terhet vissza ehhez a partihoz -
+    //    kikerul a "lobbyba" (a hivo/kliens friss sorbaallast indit).
+    //  - 2026-09-03 (felhasznaloi hibajelzes alapjan, "Online AI teszt"):
+    //    TESZT modban ez a felteteltelen elutasitas EGYENESEN ELLENTMOND a
+    //    mod sajat celjanak - ott az atvett oldal SOHA nem kerul kizarasra
+    //    (lasd _onTick: a _evictAiControlledPlayer hivasa csak
+    //    `if (!room.testMode)`-ra van felteve), tehat nezokent barmikor
+    //    vissza kellene tudjon csatlakozni, PONTOSAN ugy, mint egy meg
+    //    aktiv jatekos. Korabban azonban ITT hianyzott ez a megkulonbozetes:
+    //    ha egy mar-atvett nezo socketje BARMILYEN okbol (rovid
+    //    net-kimaradas, hatterbe kerult bongeszolap, vagy - lasd az AI
+    //    idokeret-vedelmet ai/ai.js-ben - egy hosszu "hard" AI-dontes miatt
+    //    a szerver ideiglenesen nem valaszolt a szivveresre) megszakadt, az
+    //    automatikus ujracsatlakozas itt MINDIG elutasitasra kerult, es a
+    //    kliens vegleg elhagyta a meg folyamatban levo partit ("Amíg nem
+    //    voltál itt, a gép vette át a helyedet... Új ellenfelet keresünk"
+    //    uzenettel) - ez okozta azt a felhasznaloi visszajelzest, hogy "az
+    //    uzenet csak akkor jelent meg, amikor az egyik AI nem tudott
+    //    donteni" (a hosszu AI-szamitas -> szivveres-idotullepes ->
+    //    ujracsatlakozas -> itteni felteteltelen elutasitas lancolata).
+    if (player.aiControlled && !room.testMode) {
       this.tokenToRoom.delete(sessionToken);
       return { ok: false, error: 'ai-took-over' };
     }
@@ -303,6 +338,16 @@ class RoomManager {
       clearInterval(room.timerHandle);
       return;
     }
+    // 2026-09-03 (aszinkron AI-szamitas bevezetese - lasd aiPool fenti
+    // magyarazata): amig egy korabbi tick mar elinditott egy AI-dontest a
+    // worker poolon (lasd lent, room.aiPending = true), es az meg nem ert
+    // vissza, EZT a (masodpercenkent ujra es ujra lefuto) tick-et teljesen
+    // kihagyjuk - kulonben ugyanaz a lejart kor tobbszor is feldolgozodna
+    // (pl. a kihagyott-kor-szamlalo tobbszor novekedne), mire a worker
+    // valasza megerkezik. Regebben (szinkron chooseAiMove-val) ez a helyzet
+    // soha nem allhatott elo, mert a teljes feldolgozas egyetlen tick-en
+    // BELUL, megszakithatatlanul lezajlott.
+    if (room.aiPending) return;
     const remaining = engine.tickTimer(room.state);
     if (remaining > 0) {
       this.io.to(room.roomId).emit('timer:tick', { timer: remaining });
@@ -361,16 +406,48 @@ class RoomManager {
     // gep altal atvett jatekos nem "vaktaban" jatszik tovabb. Masodlagos
     // fazisban lejaro ido (ritka szelso eset - az elsodleges mar lerakva)
     // egyszerusitesbol marad a regi, veletlenszeru viselkedes.
-    let result;
-    let usedAiChoice = false;
+    //
+    // 2026-09-03: ez a dontes MAR NEM szinkron, hanem a worker poolon
+    // (lasd this.aiPool) keresztul zajlik - amig a valasz nem erkezik meg,
+    // `room.aiPending` jelzi a tobbi tick szamara, hogy ezt a lejart kort
+    // mar feldolgozzuk (lasd a fenti korai-visszateres magyarazatat).
     if (expiredPlayer && expiredPlayer.aiControlled && phaseAtExpiry === 'primary') {
-      const move = ai.chooseAiMove(state, { difficulty: room.aiDifficulty });
-      if (move && move.primary && move.secondary) {
-        result = this._applyPair(state, move.primary, move.secondary);
-        usedAiChoice = true;
-      }
+      room.aiPending = true;
+      this.aiPool
+        .computeMove(state, { difficulty: room.aiDifficulty })
+        // Worker-hiba/lefagyas eseten se omoljon ossze a szoba - essunk
+        // vissza a mar amugy is letezo, veletlenszeru handleTimeout-ra
+        // (lasd _finishTimeoutTick `aiMove === null` aga), pontosan ugy,
+        // mintha az AI nem talalt volna ervenyes lepest.
+        .catch(() => null)
+        .then((move) => {
+          room.aiPending = false;
+          // Amig vartunk a worker valaszara, a meccs veget erhetett (pl. az
+          // ellenfel barmikor feladhatja a partit, fuggetlenul attol, ki van
+          // soron - lasd applyMove resign-kivetele) - ekkor mar nincs mit
+          // tenni, a szoba/idozito takaritasa mar megtortent.
+          if (room.state.status !== 'playing') return;
+          const validMove = move && move.primary && move.secondary ? move : null;
+          this._finishTimeoutTick(room, state, validMove);
+        });
+      return;
     }
-    if (!usedAiChoice) {
+
+    this._finishTimeoutTick(room, state, null);
+  }
+
+  /**
+   * Az _onTick() lejart-ido agat fejezi be: a mar (szinkron veletlenszeru
+   * handleTimeout-tal VAGY a worker-poolon keresztul aszinkron kiszamitott
+   * AI-dontessel) elkeszult lepest alkalmazza, majd kozvetiti/lezarja a
+   * kort - lasd a hivo helyek (fent) reszletes magyarazatat arrol, miert
+   * kulonult el ez a resz onallo fuggvennye (aszinkron AI-szamitas, 2026-09-03).
+   */
+  _finishTimeoutTick(room, state, aiMove) {
+    let result;
+    if (aiMove) {
+      result = this._applyPair(state, aiMove.primary, aiMove.secondary);
+    } else {
       result = engine.handleTimeout(state);
     }
 
@@ -494,33 +571,44 @@ class RoomManager {
       const current = room.players[room.state.currentPlayer];
       if (room.state.status !== 'playing' || !current || !current.aiControlled) return;
 
-      const move = ai.chooseAiMove(state, { difficulty: room.aiDifficulty });
-      let result;
-      if (move && move.primary && move.secondary) {
-        result = this._applyPair(state, move.primary, move.secondary);
-      } else {
-        result = engine.handleTimeout(state);
-      }
-      if (!result || !result.ok) return; // nem tortenhet meg 'playing' allapotban - biztonsagi halo
+      // 2026-09-03: a dontes mar a worker poolon (lasd this.aiPool) keresztul
+      // zajlik, nem kozvetlenul/szinkron modon a fo szalon - lasd
+      // aiWorkerPool.js fenti magyarazatat es _onTick hasonlo atalakitasat.
+      this.aiPool
+        .computeMove(state, { difficulty: room.aiDifficulty })
+        .catch(() => null) // worker-hiba/lefagyas eseten is essunk vissza a veletlenszeru lepesre
+        .then((move) => {
+          // Amig a worker szamolt, a meccs allapota (megint csak) megvaltozhatott.
+          const stillCurrent = room.players[room.state.currentPlayer];
+          if (room.state.status !== 'playing' || !stillCurrent || !stillCurrent.aiControlled) return;
 
-      // Lasd a fenti (2026-09-03) megjegyzest az _onTick-ben - ugyanaz az
-      // engine switchPlayer() altal okozott, korabban rejtve maradt hiba:
-      // az ora-ujrainditasnak MEG AZ EMITTALAS ELOTT meg kell tortennie.
-      if (state.status === 'playing') {
-        this._resetTurnTimer(room);
-      }
+          let result;
+          if (move && move.primary && move.secondary) {
+            result = this._applyPair(state, move.primary, move.secondary);
+          } else {
+            result = engine.handleTimeout(state);
+          }
+          if (!result || !result.ok) return; // nem tortenhet meg 'playing' allapotban - biztonsagi halo
 
-      this.io.to(room.roomId).emit('state:update', {
-        state: room.state,
-        cause: 'ai-move',
-        result,
-        missedTurns: this.getMissedTurnsSnapshot(room),
-      });
-      if (state.status !== 'playing') {
-        this._endMatch(room);
-        return;
-      }
-      this._maybeAutoPlayAiTurns(room, guard + 1);
+          // Lasd a fenti (2026-09-03) megjegyzest az _onTick-ben - ugyanaz az
+          // engine switchPlayer() altal okozott, korabban rejtve maradt hiba:
+          // az ora-ujrainditasnak MEG AZ EMITTALAS ELOTT meg kell tortennie.
+          if (state.status === 'playing') {
+            this._resetTurnTimer(room);
+          }
+
+          this.io.to(room.roomId).emit('state:update', {
+            state: room.state,
+            cause: 'ai-move',
+            result,
+            missedTurns: this.getMissedTurnsSnapshot(room),
+          });
+          if (state.status !== 'playing') {
+            this._endMatch(room);
+            return;
+          }
+          this._maybeAutoPlayAiTurns(room, guard + 1);
+        });
     };
 
     if (this.aiMoveDelayMs > 0) {
