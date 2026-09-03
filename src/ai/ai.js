@@ -511,12 +511,28 @@ function pickBestSecondary(state, mover, primary, weights) {
   const mySymbols = PLAYER_SYMBOLS[mover];
   const oppSymbols = PLAYER_SYMBOLS[otherPlayer(mover)];
 
-  // Ideiglenesen lerakjuk a primary-t (csak egy tabla-masolaton, a state-et
-  // nem piszkaljuk), hogy a masodlagos jeloltek mar egy konzisztens
-  // tabla-allapotot lassanak (a masodlagos mindig az elsodleges szomszedja
-  // kell legyen).
-  const afterPrimaryBoard = state.board.map((row) => row.map((f) => ({ ...f })));
-  afterPrimaryBoard[primary.row][primary.col] = {
+  // 2026-09-03 hatekonysagi javitas (Totti kerte, a "hard" AI vedekezo
+  // ellenorzesenek [findForcedWin] idozitesi versenyhelyzete miatt vegzett
+  // profilozas alapjan - lasd a projekt-jegyzeteket): korabban itt a TELJES
+  // tabla (`state.board`, meret^2 cella) ketszer is lemasolodott JELOLTENKENT
+  // (egyszer az elsodleges lerakasahoz, majd MEG EGYSZER minden egyes
+  // lehetseges masodlagos jelolthoz) - holott a jelolt-mezok kivalasztasa
+  // (getBorderCells) valtozatlanul csak a mar lerakott kovek koruli szuk
+  // korre korlatozodik, es valojaban csak 1-2 mezo tartalma valtozik egy-egy
+  // kiertekeleshez. A meresek szerint ez a redundans masolgatas adta a hard
+  // AI vedekezo keresesenek (findForcedWin) teljes futasi idejenek kb. 44%-at.
+  // Javitas: a VALODI `state.board` tombot piszkaljuk ideiglenesen (csak a
+  // celzott 1-2 cellat irjuk at), es MINDEN kilepesi agon (a korai "nincs
+  // ervenyes masodlagos szomszed" esetet is beleertve) garantaltan
+  // visszaallitjuk MIELOTT visszaternenk. A fuggveny szerzodese valtozatlan:
+  // a hivo `state`-je a visszateres pillanataban bit-pontosan ugyanaz, mint
+  // hivas elott volt - csak az UTKOZO masolas tunik el. Az ertekeles sorrendje
+  // es a dontetlen-eldontes (elso minimalis koltsegu jelolt nyer) is
+  // valtozatlan, tehat ez a lepesvalasztast (barmelyik nehezsegi szinten)
+  // egyaltalan nem befolyasolja, kizarolag gyorsitja.
+  const board = state.board;
+  const originalPrimaryCell = board[primary.row][primary.col];
+  board[primary.row][primary.col] = {
     state: mySymbols.primary,
     owner: mover,
     role: 'primary',
@@ -524,9 +540,8 @@ function pickBestSecondary(state, mover, primary, weights) {
   };
 
   const secondaryCandidates = neighborsOf(state.size, primary.row, primary.col).filter(
-    (p) => afterPrimaryBoard[p.row][p.col].state === 'empty'
+    (p) => board[p.row][p.col].state === 'empty'
   );
-  if (secondaryCandidates.length === 0) return null;
 
   let bestSecondary = null;
   let bestCost = Infinity; // C + D, minimalizalando
@@ -536,17 +551,18 @@ function pickBestSecondary(state, mover, primary, weights) {
     // D: a kenyszeru masodlagos (O, ami az ELLENFEL primary szimboluma nem,
     // hanem a MI sajat masodlagos szimbolunk) mennyire rontja a SAJAT
     // (primary szimbolumu) sorunkat azzal, hogy elfoglalja ezt a mezot.
-    const d = cellValueFor(afterPrimaryBoard, state.size, secondary, mySymbols.primary);
+    const d = cellValueFor(board, state.size, secondary, mySymbols.primary);
     // C: a masodlagos szimbolum (=ellenfel primary szimboluma!) mennyire
     // segiti most MAR odarakva az ellenfel sorat.
-    const afterSecondaryBoard = afterPrimaryBoard.map((row) => row.map((f) => ({ ...f })));
-    afterSecondaryBoard[secondary.row][secondary.col] = {
+    const originalSecondaryCell = board[secondary.row][secondary.col];
+    board[secondary.row][secondary.col] = {
       state: mySymbols.secondary,
       owner: mover,
       role: 'secondary',
       turnIndex: state.turnIndex,
     };
-    const c = cellValueFor(afterSecondaryBoard, state.size, secondary, oppSymbols.primary);
+    const c = cellValueFor(board, state.size, secondary, oppSymbols.primary);
+    board[secondary.row][secondary.col] = originalSecondaryCell; // visszaallitas
 
     const cost = weighted(c, weights.C) + weighted(d, weights.D);
     if (cost < bestCost) {
@@ -557,6 +573,9 @@ function pickBestSecondary(state, mover, primary, weights) {
     }
   }
 
+  board[primary.row][primary.col] = originalPrimaryCell; // visszaallitas
+
+  if (!bestSecondary) return null;
   return { secondary: bestSecondary, c: bestC, d: bestD };
 }
 
