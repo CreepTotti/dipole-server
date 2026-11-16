@@ -56,6 +56,34 @@ function createServer({
   // kulonben a worker-szalak feleslegesen elve maradnanak.
   httpServer.on('close', () => rooms.shutdownAiPool());
 
+  // 2026-11-16 (felhasznaloi visszajelzes alapjan - "nem erem el a dipole
+  // szervert a renderen, pedig a kapcsolat el a jatek eseteben"): egy sima
+  // Socket.io szerver NEM valaszol semmit egy egyszeru bongeszos GET
+  // kéresre a gyoker URL-re - az Engine.io a maga 'request' listenerevel
+  // CSAK a sajat protokoll-utjaira (alapertelmezetten '/socket.io/...')
+  // valaszol, minden mas utra nemán nem csinal semmit, igy a kerés
+  // csak timeoutol. Ez NEM hiba, de nincs mod kivulrol (bongeszobol,
+  // vagy egy egyszeru HTTP health-check-bol) ellenorizni, hogy a szerver
+  // tenyleg fut-e. Ez a kulon 'request' listener ad egy minimalis
+  // "elettani jelet": MINDEN utra valaszol, KIVEVE a '/socket.io'-val
+  // kezdodo utakat, azokat szandekosan erintetlenul hagyja, hogy az
+  // Engine.io sajat (fuggetlenul regisztralt) listenere kezelje tovabbra
+  // is - igy a ket listener nem zavarja egymast, regisztracios sorrendtol
+  // fuggetlenul.
+  httpServer.on('request', (req, res) => {
+    if (req.url && req.url.startsWith('/socket.io')) return;
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        service: 'dipole-server',
+        status: 'alive',
+        uptimeSec: Math.floor(process.uptime()),
+        activeRooms: rooms.rooms ? rooms.rooms.size : undefined,
+      })
+    );
+  });
+
   io.on('connection', (socket) => {
     socket.on('queue:join', ({ displayName, mode } = {}) => {
       const result = rooms.joinQueue(socket, displayName, mode);
